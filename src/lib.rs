@@ -1,9 +1,13 @@
-use uuid::Uuid;
-
 use {
+    polars::{
+        datatypes::{DataType, TimeUnit},
+        prelude::*,
+        series::Series,
+    },
     serde::{Deserialize, Serialize},
     std::collections::{HashMap, HashSet},
-    std::fs,
+    std::{fs, time::SystemTime},
+    uuid::Uuid,
 };
 
 // Features
@@ -17,6 +21,7 @@ use {
 pub enum DeltaError {
     IOError(std::io::Error),
     JsonError(serde_json::Error),
+    PolarsError(PolarsError),
     InvalidType,
     InvalidTable,
     TableAlreadyExists,
@@ -31,6 +36,12 @@ impl From<std::io::Error> for DeltaError {
 impl From<serde_json::Error> for DeltaError {
     fn from(value: serde_json::Error) -> DeltaError {
         DeltaError::JsonError(value)
+    }
+}
+
+impl From<PolarsError> for DeltaError {
+    fn from(value: PolarsError) -> Self {
+        DeltaError::PolarsError(value)
     }
 }
 
@@ -81,11 +92,49 @@ impl DeltaTable {
 
         // Write the first log file
         fs::write(
-            format!("{}/000.log", &table.logs_dir),
+            table.next_log_file()?,
             serde_json::to_string(&table.metadata)?,
         )?;
 
         Ok(table)
+    }
+
+    pub fn insert(&self, data: Vec<Vec<&str>>) -> Result<(), DeltaError> {
+        let n_cols = self.metadata.schema.fields.len();
+
+        // Bad, should fix this
+        let cols = (0..n_cols)
+            .map(|i| {
+                let s = Series::new(
+                    &self.metadata.schema.fields[i].name,
+                    data.iter().map(|row| row[i]).collect::<Vec<&str>>(),
+                );
+                s.cast(&self.metadata.schema.fields[i].typ.to_polars_type())
+                    .unwrap()
+            })
+            .collect::<Vec<Series>>();
+
+        let mut df = DataFrame::new(cols)?;
+
+        let data_path = self.next_data_file()?;
+        let data_file = fs::File::create(&data_path)?;
+        let data_file_size = ParquetWriter::new(data_file).finish(&mut df)?;
+
+        fs::write(
+            self.next_log_file()?,
+            serde_json::to_string(&Action::Add {
+                path: data_path,
+                partition_values: HashMap::new(),
+                size: data_file_size,
+                modification_time: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+                data_change: true,
+            })?,
+        )?;
+
+        Ok(())
     }
 
     pub fn get_datafiles(&self) -> Result<HashSet<String>, DeltaError> {
@@ -119,6 +168,18 @@ impl DeltaTable {
 
         Ok(data_files)
     }
+
+    fn next_data_file(&self) -> Result<String, DeltaError> {
+        // Hacky, but do `n-1` instead of `n` for data files because
+        // one of the entries in the base dir is the logs directory.
+        let n = fs::read_dir(&self.base_dir)?.collect::<Vec<_>>().len();
+        return Ok(format!("{}/{:0>20}.parquet", self.base_dir, n - 1));
+    }
+
+    fn next_log_file(&self) -> Result<String, DeltaError> {
+        let n = fs::read_dir(&self.logs_dir)?.collect::<Vec<_>>().len();
+        return Ok(format!("{}/{:0>20}.log", self.logs_dir, n));
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -128,7 +189,7 @@ enum Action {
         path: String,
         partition_values: HashMap<String, String>,
         size: u64,
-        modification_time: u64,
+        modification_time: u128,
         data_change: bool,
     },
     Remove {
@@ -246,7 +307,6 @@ enum DeltaTableType {
     Byte,
     Float,
     Double,
-    Decimal,
     Boolean,
     Date,
     Timestamp,
@@ -272,7 +332,6 @@ impl DeltaTableType {
             "TINYINT" => Ok(DeltaTableType::Byte),
             "FLOAT" => Ok(DeltaTableType::Float),
             "DOUBLE" => Ok(DeltaTableType::Double),
-            "DECIMAL" => Ok(DeltaTableType::Decimal),
             "BOOL" => Ok(DeltaTableType::Boolean),
             "DATE" => Ok(DeltaTableType::Date),
             "TIMESTAMP" => Ok(DeltaTableType::Timestamp),
@@ -280,19 +339,18 @@ impl DeltaTableType {
         }
     }
 
-    fn to_sql_type(&self) -> String {
+    fn to_polars_type(&self) -> DataType {
         match self {
-            Self::String => "TEXT".to_owned(),
-            Self::Long => "BIGINT".to_owned(),
-            Self::Integer => "INT".to_owned(),
-            Self::Short => "SMALLINT".to_owned(),
-            Self::Byte => "TINYINT".to_owned(),
-            Self::Float => "FLOAT".to_owned(),
-            Self::Double => "DOUBLE".to_owned(),
-            Self::Decimal => "DECIMAL".to_owned(),
-            Self::Boolean => "BOOL".to_owned(),
-            Self::Date => "DATE".to_owned(),
-            Self::Timestamp => "TIMESTAMP".to_owned(),
+            Self::String => DataType::Utf8,
+            Self::Long => DataType::Int64,
+            Self::Integer => DataType::Int32,
+            Self::Short => DataType::Int16,
+            Self::Byte => DataType::Int8,
+            Self::Float => DataType::Float32,
+            Self::Double => DataType::Float64,
+            Self::Boolean => DataType::Boolean,
+            Self::Date => DataType::Date,
+            Self::Timestamp => DataType::Datetime(TimeUnit::Microseconds, None),
         }
     }
 }
