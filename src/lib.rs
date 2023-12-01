@@ -1,3 +1,5 @@
+use polars::sql::SQLContext;
+
 use {
     polars::{
         datatypes::{DataType, TimeUnit},
@@ -16,6 +18,7 @@ use {
 //  [ ] Delete from table -- DELETE FROM <TABLE_NAME> WHERE expr
 //  [ ] Query a table -- SELECT expr FROM <TABLE_NAME> WHERE expr
 //  [ ] Update a table -- UPDATE <TABLE_NAME> SET col1=val1, col2=val2, ... WHERE expr
+//  [ ] SQL query parser and command line tool
 
 #[derive(Debug)]
 pub enum DeltaError {
@@ -52,6 +55,10 @@ pub struct DeltaTable {
 }
 
 impl DeltaTable {
+    pub fn read_table(name: &str) -> Result<DeltaTable, DeltaError> {
+        todo!("read and set metadata");
+    }
+
     pub fn create_table(name: &str, schema: Vec<(&str, &str)>) -> Result<DeltaTable, DeltaError> {
         let id = Uuid::new_v4();
 
@@ -119,22 +126,87 @@ impl DeltaTable {
 
         let mut df = DataFrame::new(cols)?;
 
-        let data_path = self.next_data_file()?;
-        let data_file = fs::File::create(format!("{}/{}", self.base_dir, data_path))?;
-        let data_file_size = ParquetWriter::new(data_file).finish(&mut df)?;
+        let data_file = self.write_data_file(&mut df)?;
 
         fs::write(
             format!("{}/{}", self.logs_dir, self.next_log_file()?),
             serde_json::to_string(&Action::Add {
-                path: data_path,
+                path: data_file.name,
                 partition_values: HashMap::new(),
-                size: data_file_size,
+                size: data_file.size,
                 modification_time: SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap()
                     .as_millis(),
                 data_change: true,
             })?,
+        )?;
+
+        Ok(())
+    }
+
+    // For now delete assumes single writer, meaning no race conditions
+    // where a new log file is added during the deletion. Should look into
+    // how to handle that long term.
+    pub fn delete(&self, expr: &str) -> Result<(), DeltaError> {
+        let query = format!("SELECT * FROM df WHERE NOT ({});", expr);
+
+        let mut created_files: Vec<DataFile> = vec![];
+        let mut deleted_files: Vec<String> = vec![];
+
+        let files = self.get_datafiles()?;
+        for file in files {
+            let df = LazyFrame::scan_parquet(
+                format!("{}/{}", &self.base_dir, &file),
+                Default::default(),
+            )?
+            .collect()?;
+
+            let original_rows = df.height();
+
+            let mut ctx = SQLContext::new();
+            ctx.register("df", df.lazy());
+            let mut updated = ctx.execute(&query)?.collect()?;
+
+            if updated.height() == original_rows {
+                continue; // No rows deleted
+            }
+
+            created_files.push(self.write_data_file(&mut updated)?);
+            deleted_files.push(file)
+        }
+
+        let modification_time = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+
+        let mut actions: Vec<String> = vec![];
+        for created in created_files {
+            let action = Action::Add {
+                path: created.name,
+                partition_values: HashMap::new(),
+                size: created.size,
+                modification_time,
+                data_change: true,
+            };
+
+            actions.push(serde_json::to_string(&action)?);
+        }
+
+        for deleted in deleted_files {
+            let action = Action::Remove {
+                path: deleted,
+                data_change: true,
+            };
+
+            actions.push(serde_json::to_string(&action)?);
+        }
+
+        let contents = actions.join("\n");
+        fs::write(
+            format!("{}/{}", self.logs_dir, self.next_log_file()?),
+            contents,
         )?;
 
         Ok(())
@@ -162,9 +234,7 @@ impl DeltaTable {
                     Action::Remove { path, .. } => {
                         removed_files.insert(path);
                     }
-                    Action::Metadata { .. } => {
-                        todo!("Set the table's schema")
-                    }
+                    Action::Metadata { .. } => {}
                 }
             }
         }
@@ -183,6 +253,22 @@ impl DeltaTable {
         let n = fs::read_dir(&self.logs_dir)?.collect::<Vec<_>>().len();
         return Ok(format!("{:0>20}.json", n));
     }
+
+    fn write_data_file(&self, df: &mut DataFrame) -> Result<DataFile, DeltaError> {
+        let data_file = self.next_data_file()?;
+        let file = fs::File::create(format!("{}/{}", self.base_dir, data_file))?;
+        let data_file_size = ParquetWriter::new(file).finish(df)?;
+
+        return Ok(DataFile {
+            name: data_file,
+            size: data_file_size,
+        });
+    }
+}
+
+struct DataFile {
+    name: String,
+    size: u64,
 }
 
 #[derive(Serialize, Deserialize)]
