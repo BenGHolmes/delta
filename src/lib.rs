@@ -61,18 +61,21 @@ impl DeltaTable {
         };
 
         let schema = DeltaTableSchema::from_sql(schema)?;
+        if !schema.is_valid() {
+            return Err(DeltaError::InvalidTable);
+        }
 
         let table = DeltaTable {
             metadata: DeltaTableMetadata {
                 id,
                 name: name.to_owned(),
                 format,
-                schema,
+                schema_string: serde_json::to_string(&schema)?,
                 partition_columns: vec![],
                 configuration: HashMap::new(),
             },
             base_dir: format!("tables/{}", name),
-            logs_dir: format!("tables/{}/logs", name),
+            logs_dir: format!("tables/{}/_delta_log", name),
         };
 
         if !table.metadata.is_valid() {
@@ -92,36 +95,36 @@ impl DeltaTable {
 
         // Write the first log file
         fs::write(
-            table.next_log_file()?,
-            serde_json::to_string(&table.metadata)?,
+            format!("{}/{}", &table.logs_dir, table.next_log_file()?),
+            serde_json::to_string(&Action::Metadata(table.metadata.clone()))?,
         )?;
 
         Ok(table)
     }
 
     pub fn insert(&self, data: Vec<Vec<&str>>) -> Result<(), DeltaError> {
-        let n_cols = self.metadata.schema.fields.len();
+        let schema: DeltaTableSchema = serde_json::from_str(&self.metadata.schema_string)?;
+        let n_cols = schema.fields.len();
 
         // Bad, should fix this
         let cols = (0..n_cols)
             .map(|i| {
                 let s = Series::new(
-                    &self.metadata.schema.fields[i].name,
+                    &schema.fields[i].name,
                     data.iter().map(|row| row[i]).collect::<Vec<&str>>(),
                 );
-                s.cast(&self.metadata.schema.fields[i].typ.to_polars_type())
-                    .unwrap()
+                s.cast(&schema.fields[i].typ.to_polars_type()).unwrap()
             })
             .collect::<Vec<Series>>();
 
         let mut df = DataFrame::new(cols)?;
 
         let data_path = self.next_data_file()?;
-        let data_file = fs::File::create(&data_path)?;
+        let data_file = fs::File::create(format!("{}/{}", self.base_dir, data_path))?;
         let data_file_size = ParquetWriter::new(data_file).finish(&mut df)?;
 
         fs::write(
-            self.next_log_file()?,
+            format!("{}/{}", self.logs_dir, self.next_log_file()?),
             serde_json::to_string(&Action::Add {
                 path: data_path,
                 partition_values: HashMap::new(),
@@ -173,12 +176,12 @@ impl DeltaTable {
         // Hacky, but do `n-1` instead of `n` for data files because
         // one of the entries in the base dir is the logs directory.
         let n = fs::read_dir(&self.base_dir)?.collect::<Vec<_>>().len();
-        return Ok(format!("{}/{:0>20}.parquet", self.base_dir, n - 1));
+        return Ok(format!("{:0>20}.parquet", n - 1));
     }
 
     fn next_log_file(&self) -> Result<String, DeltaError> {
         let n = fs::read_dir(&self.logs_dir)?.collect::<Vec<_>>().len();
-        return Ok(format!("{}/{:0>20}.log", self.logs_dir, n));
+        return Ok(format!("{:0>20}.json", n));
     }
 }
 
@@ -200,13 +203,16 @@ enum Action {
     Metadata(DeltaTableMetadata),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DeltaTableMetadata {
     id: Uuid,
     name: String,
     format: DeltaTableFormat,
-    schema: DeltaTableSchema,
+    // TODO: add back schema field, and implement
+    // custom serialize and deserialize logic
+    // schema: DeltaTableSchema,
+    schema_string: String,
     partition_columns: Vec<String>,
     configuration: HashMap<String, String>,
 }
@@ -214,13 +220,13 @@ struct DeltaTableMetadata {
 impl DeltaTableMetadata {
     fn is_valid(&self) -> bool {
         self.format.is_valid()
-            && self.schema.is_valid()
+            // && self.schema.is_valid() // TODO: add back
             && self.partition_columns.is_empty()
             && self.configuration.is_empty()
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DeltaTableFormat {
     provider: String,
@@ -236,7 +242,7 @@ impl DeltaTableFormat {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DeltaTableSchema {
     fields: Vec<DeltaTableColumnDefinition>,
@@ -278,7 +284,7 @@ impl DeltaTableSchema {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DeltaTableColumnDefinition {
     name: String,
@@ -297,7 +303,7 @@ impl DeltaTableColumnDefinition {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 enum DeltaTableType {
     String,
@@ -316,7 +322,7 @@ enum DeltaTableType {
 // for the metadata schema field. Don't want to support structs in general
 // yet, but this allows us to add a hardcoded field to the DeltaTableSchema
 // struct. Without this we'd just need to make it a string and validate.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 enum DeltaTableStructType {
     Struct,
