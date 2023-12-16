@@ -26,7 +26,19 @@ pub struct DeltaTable {
 
 impl DeltaTable {
     pub fn read_table(name: &str) -> Result<DeltaTable, DeltaError> {
-        todo!("read and set metadata");
+        let base_dir = format!("tables/{}", name);
+        let logs_dir = format!("tables/{}/_delta_log", name);
+
+        let contents = fs::read_to_string(format!("{}/{}", logs_dir, DeltaTable::log_file(0)))?;
+        if let Ok(Action::Metadata(metadata)) = serde_json::from_str(&contents) {
+            return Ok(DeltaTable {
+                metadata,
+                base_dir,
+                logs_dir,
+            });
+        }
+
+        return Err(DeltaError::InvalidTable);
     }
 
     pub fn create_table(name: &str, schema: Vec<(&str, &str)>) -> Result<DeltaTable, DeltaError> {
@@ -228,5 +240,9 @@ impl DeltaTable {
             name: data_file,
             size: data_file_size,
         });
+    }
+
+    fn log_file(idx: usize) -> String {
+        format!("{:0>20}.json", idx)
     }
 }

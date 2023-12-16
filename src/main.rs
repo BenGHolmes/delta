@@ -9,6 +9,8 @@ fn main() -> Result<(), DeltaError> {
         vec!["3", "the final row"],
     ])?;
 
+    let table = DeltaTable::read_table("my-table")?;
+
     table.insert(vec![vec!["4", "second insert"]])?;
 
     table.delete("bar = 'test row' OR foo = 2")?; // Expect to delete 1 and 2
